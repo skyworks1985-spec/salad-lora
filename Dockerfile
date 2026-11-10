@@ -36,6 +36,7 @@ RUN pip install -r requirements.txt \
     && python -c "import torch, bitsandbytes; print('torch', torch.__version__, '| cuda', torch.version.cuda)"
 
 COPY entrypoint.sh /entrypoint.sh
+COPY hf_put.py /opt/hf_put.py
 RUN chmod +x /entrypoint.sh
 
 WORKDIR /workspace
