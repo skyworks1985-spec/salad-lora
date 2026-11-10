@@ -35,7 +35,13 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 SEED="${SEED:-42}"
 CACHE_LATENTS_TO_DISK="${CACHE_LATENTS_TO_DISK:-0}"  # 1 = also write latent cache to disk
 
-# Upload target configuration. UPLOAD_MODE: put | rclone | none
+# Hugging Face storage (decided 2026-11-11): private repo Works403/lora-storage
+# holds models/, datasets/ and outputs/. Downloads of the private repo need
+# HF_TOKEN; UPLOAD_MODE=hf uploads results back into outputs/<OUTPUT_NAME>/.
+HF_TOKEN="${HF_TOKEN:-}"                        # HF access token (write)
+HF_REPO="${HF_REPO:-Works403/lora-storage}"     # storage repo id
+
+# Upload target configuration. UPLOAD_MODE: hf | put | rclone | none
 UPLOAD_MODE="${UPLOAD_MODE:-none}"
 UPLOAD_PUT_BASE_URL="${UPLOAD_PUT_BASE_URL:-}"  # PUT base URL, file name is appended
 UPLOAD_AUTH_HEADER="${UPLOAD_AUTH_HEADER:-}"    # optional, e.g. "Authorization: Bearer xxx"
@@ -62,18 +68,22 @@ marker() { echo "===== [salad-lora] $* ====="; }
 # Pluggable single-file upload. Returns 0 when the file is safely stored
 # (or when UPLOAD_MODE=none, in which case it only logs the intent).
 #
-# TODO(storage): the file host for model/dataset/results is not decided yet.
-#   - "put"    expects UPLOAD_PUT_BASE_URL to accept HTTP PUT of a raw file
-#              (presigned URL base, or a token-protected endpoint via
-#              UPLOAD_AUTH_HEADER). The file name is appended to the base.
-#   - "rclone" expects RCLONE_REMOTE like "remote:bucket/prefix" and an image
-#              that ships rclone plus its config (not in the current image).
-#   Decide the host, then verify this function end to end in the smoke test.
+# Storage is Hugging Face (decided 2026-11-11): UPLOAD_MODE=hf sends the file
+# to outputs/<OUTPUT_NAME>/ in HF_REPO via /opt/hf_put.py (Git LFS flow).
+# "put" and "rclone" remain as fallbacks for other hosts.
 upload_file() {
   local file="$1"
   local name
   name="$(basename "$file")"
   case "$UPLOAD_MODE" in
+    hf)
+      if [ -z "$HF_TOKEN" ]; then
+        log "ERROR: UPLOAD_MODE=hf but HF_TOKEN is empty; cannot upload $name"
+        return 1
+      fi
+      python3 /opt/hf_put.py "$file" "outputs/$OUTPUT_NAME/$name" \
+        "Upload $name ($OUTPUT_NAME)"
+      ;;
     put)
       if [ -z "$UPLOAD_PUT_BASE_URL" ]; then
         log "ERROR: UPLOAD_MODE=put but UPLOAD_PUT_BASE_URL is empty; cannot upload $name"
@@ -166,13 +176,16 @@ mkdir -p "$(dirname "$MODEL_FILE")" "$EXTRACT_DIR" "$OUTPUT_DIR"
 touch "$UPLOAD_MANIFEST"
 
 marker "DOWNLOAD base model"
+# Private HF repo downloads need the token; public URLs work without it.
+declare -a DL_AUTH=()
+if [ -n "$HF_TOKEN" ]; then DL_AUTH=(-H "Authorization: Bearer $HF_TOKEN"); fi
 # -C - resumes a partial download after a node interruption restarts the job.
-curl -fL --retry 5 --retry-all-errors -C - -o "$MODEL_FILE" "$MODEL_URL" || {
+curl -fL --retry 5 --retry-all-errors -C - -o "$MODEL_FILE" "${DL_AUTH[@]}" "$MODEL_URL" || {
   log "ERROR: model download failed"; exit 2; }
 ls -lh "$MODEL_FILE"
 
 marker "DOWNLOAD dataset"
-curl -fL --retry 5 --retry-all-errors -o "$DATASET_ZIP" "$DATASET_ZIP_URL" || {
+curl -fL --retry 5 --retry-all-errors -o "$DATASET_ZIP" "${DL_AUTH[@]}" "$DATASET_ZIP_URL" || {
   log "ERROR: dataset download failed"; exit 2; }
 unzip -q -o "$DATASET_ZIP" -d "$EXTRACT_DIR" || {
   log "ERROR: dataset unzip failed"; exit 2; }
