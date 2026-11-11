@@ -24,6 +24,8 @@ DATASET_ZIP_URL="${DATASET_ZIP_URL:-}"     # required: dataset .zip (kohya folde
 OUTPUT_NAME="${OUTPUT_NAME:-lora}"         # output file base name / trigger folder set name
 EPOCHS="${EPOCHS:-5}"                      # epochs (ignored when MAX_TRAIN_STEPS is set)
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"     # optional step cap, e.g. 100 for the smoke test
+DIAG_MODE="${DIAG_MODE:-}"                   # "survival" = downloads only, heartbeat, no training
+DIAG_MINUTES="${DIAG_MINUTES:-30}"           # survival-mode heartbeat duration, in minutes
 
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
@@ -192,6 +194,27 @@ unzip -q -o "$DATASET_ZIP" -d "$EXTRACT_DIR" || {
 TRAIN_DATA_DIR="$(detect_train_dir "$EXTRACT_DIR")"
 IMG_COUNT="$(find "$TRAIN_DATA_DIR" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) | wc -l)"
 log "train_data_dir=$TRAIN_DATA_DIR images=$IMG_COUNT"
+
+# ---------------------------------------------------------------------------
+# Diagnostic survival mode (DIAG_MODE=survival)
+#
+# Downloads finish exactly as in a normal run, but instead of training the
+# container heartbeats for DIAG_MINUTES and then exits 0 on its own. This
+# separates Salad node instability from training-side crashes: if an instance
+# cannot survive even this, the node side is at fault; if it survives the
+# full window, the training path is the suspect.
+# ---------------------------------------------------------------------------
+if [ "$DIAG_MODE" = "survival" ]; then
+  marker "DIAG MODE survival: downloads done, training skipped (heartbeat ${DIAG_MINUTES} min)"
+  DIAG_START="$(date +%s)"
+  DIAG_END=$(( DIAG_START + DIAG_MINUTES * 60 ))
+  while [ "$(date +%s)" -lt "$DIAG_END" ]; do
+    log "DIAG heartbeat: alive, elapsed $(( $(date +%s) - DIAG_START ))s of $(( DIAG_MINUTES * 60 ))s"
+    sleep 60
+  done
+  marker "DIAG SURVIVED the full ${DIAG_MINUTES} minutes; exiting 0"
+  exit 0
+fi
 
 marker "START checkpoint watcher (interval ${WATCH_INTERVAL}s)"
 watcher_loop &
