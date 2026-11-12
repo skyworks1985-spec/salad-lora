@@ -8,7 +8,11 @@
 #   2. runs training, streaming logs to stdout (visible via the Salad logs API),
 #   3. runs a background watcher that uploads every epoch checkpoint the
 #      moment it appears, so an interruption loses at most the current epoch,
-#   4. uploads remaining outputs and the training log at the end.
+#   4. uploads remaining outputs and the training log at the end,
+#   5. optionally ships the console log (run.log) for outside visibility:
+#      to ntfy.sh when LOG_TOPIC is set (0.3.0), and as a live snapshot to
+#      outputs/<OUTPUT_NAME>/run.log on HF when UPLOAD_MODE=hf (0.4.0),
+#      because the Salad logs API returns 404 for this project.
 #
 # Training parameters mirror the known-good local recipe (see README.md).
 # Exit code: 0 on training success, 2 on configuration error, otherwise the
@@ -27,6 +31,7 @@ MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"     # optional step cap, e.g. 100 for the
 DIAG_MODE="${DIAG_MODE:-}"                   # "survival" = downloads only, heartbeat, no training
 DIAG_MINUTES="${DIAG_MINUTES:-30}"           # survival-mode heartbeat duration, in minutes
 LOG_TOPIC="${LOG_TOPIC:-}"                   # if set, ship run.log to ntfy.sh/$LOG_TOPIC (log visibility)
+HF_SHIP_INTERVAL="${HF_SHIP_INTERVAL:-30}"   # seconds between HF run.log snapshot uploads (UPLOAD_MODE=hf)
 
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
@@ -64,6 +69,9 @@ SHIP_OFFSET_FILE="$WORK_ROOT/.ship_offset"
 SHIP_STOP_FILE="$WORK_ROOT/.ship_stop"
 SHIP_CHUNK_MAX=3500
 SHIPPER_PID=""
+HF_SHIP_MARK_FILE="$WORK_ROOT/.hf_ship_mark"
+HF_SHIP_STOP_FILE="$WORK_ROOT/.hf_ship_stop"
+HF_SHIP_PID=""
 UPLOAD_MANIFEST="$WORK_ROOT/.uploaded"
 
 # ---------------------------------------------------------------------------
@@ -246,24 +254,116 @@ shipper_loop() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# HF log shipping — diagnostic log visibility (added in 0.4.0)
+#
+# When UPLOAD_MODE=hf, a background shipper snapshots $RUN_LOG to
+# outputs/<OUTPUT_NAME>/run.log in HF_REPO every HF_SHIP_INTERVAL seconds
+# (and immediately when a new phase marker appears), overwriting the same
+# path via /opt/hf_put.py. An outside reader can therefore follow the run
+# live through the HF connector, and the last snapshot survives a sudden
+# node loss. While HF_TOKEN is empty the shipper waits quietly (one note,
+# no repeated upload attempts): the user pastes the token into the group's
+# env in the Salad portal, Salad redeploys the container, and the new
+# process starts shipping immediately. On exit, a trap uploads the final
+# snapshot, and the final sweep in Main uploads run.log once more. Every
+# step is best-effort (|| true): a shipper failure must never affect the
+# main flow. With UPLOAD_MODE != hf and LOG_TOPIC unset, behavior is
+# identical to 0.2.0.
+# ---------------------------------------------------------------------------
+hf_ship_snapshot() {
+  # Upload one snapshot of $RUN_LOG to outputs/$OUTPUT_NAME/run.log.
+  # Records the snapshot size in HF_SHIP_MARK_FILE on success.
+  [ "$UPLOAD_MODE" = "hf" ] || return 0
+  [ -n "$HF_TOKEN" ] || return 0
+  [ -f "$RUN_LOG" ] || return 0
+  local snap="$WORK_ROOT/.runlog_snapshot" sz=0
+  cp "$RUN_LOG" "$snap" 2>/dev/null || return 0
+  sz="$(stat -c%s "$snap" 2>/dev/null || echo 0)"
+  if python3 /opt/hf_put.py "$snap" "outputs/$OUTPUT_NAME/run.log" \
+       "Update run.log ($OUTPUT_NAME)" >/dev/null 2>&1; then
+    echo "$sz" > "$HF_SHIP_MARK_FILE" || true
+    return 0
+  fi
+  return 1
+}
+
+hf_unsent_has_marker() {
+  # True when the part of $RUN_LOG beyond the last shipped snapshot
+  # contains a phase marker line.
+  [ -f "$RUN_LOG" ] || return 1
+  local size=0 sent=0
+  size="$(stat -c%s "$RUN_LOG" 2>/dev/null || echo 0)"
+  [ -f "$HF_SHIP_MARK_FILE" ] && sent="$(cat "$HF_SHIP_MARK_FILE" 2>/dev/null || echo 0)"
+  case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
+  [ "$size" -gt "$sent" ] || return 1
+  tail -c +$(( sent + 1 )) "$RUN_LOG" 2>/dev/null | grep -q '===== \[salad-lora\]'
+}
+
+hf_shipper_loop() {
+  local last=0 now=0 size=0 sent=0
+  last="$(date +%s)"
+  if [ -z "$HF_TOKEN" ]; then
+    # The token is pasted into the group env in the Salad portal and only
+    # reaches the container on the next (re)deploy, so just wait quietly:
+    # note it once and keep retrying without attempting uploads.
+    log "HF log shipper: HF_TOKEN not set; waiting quietly (add it via the Salad portal env and the container will ship run.log after redeploy)"
+  fi
+  while [ ! -f "$HF_SHIP_STOP_FILE" ]; do
+    sleep 5
+    [ -n "$HF_TOKEN" ] || continue
+    now="$(date +%s)"
+    size="$(stat -c%s "$RUN_LOG" 2>/dev/null || echo 0)"
+    sent=0
+    [ -f "$HF_SHIP_MARK_FILE" ] && sent="$(cat "$HF_SHIP_MARK_FILE" 2>/dev/null || echo 0)"
+    case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
+    [ "$size" -gt "$sent" ] || continue
+    if hf_unsent_has_marker || [ $(( now - last )) -ge "$HF_SHIP_INTERVAL" ]; then
+      hf_ship_snapshot || true
+      last="$(date +%s)"
+    fi
+  done
+}
+
 on_exit_ship() {
   local rc=$?
-  [ -n "$LOG_TOPIC" ] || return 0
-  sleep 2 || true   # give tee a moment to flush the last lines into run.log
-  ship_new_log || true
-  ntfy_post "FINAL rc=$rc" || true
-  [ -n "$SHIPPER_PID" ] && kill "$SHIPPER_PID" >/dev/null 2>&1 || true
+  if [ -n "$LOG_TOPIC" ] || [ "$UPLOAD_MODE" = "hf" ]; then
+    sleep 2 || true   # give tee a moment to flush the last lines into run.log
+  fi
+  if [ "$UPLOAD_MODE" = "hf" ]; then
+    # Stop the shipper loop first so it cannot race the final snapshot.
+    touch "$HF_SHIP_STOP_FILE" || true
+    [ -n "$HF_SHIP_PID" ] && kill "$HF_SHIP_PID" >/dev/null 2>&1 || true
+    hf_ship_snapshot || true
+  fi
+  if [ -n "$LOG_TOPIC" ]; then
+    ship_new_log || true
+    ntfy_post "FINAL rc=$rc" || true
+    [ -n "$SHIPPER_PID" ] && kill "$SHIPPER_PID" >/dev/null 2>&1 || true
+  fi
   return 0
 }
 
-if [ -n "$LOG_TOPIC" ]; then
+# Log collection (tee into $RUN_LOG) and the shippers run when either
+# channel is enabled: ntfy (LOG_TOPIC) or HF (UPLOAD_MODE=hf).
+LOG_COLLECT=0
+[ -n "$LOG_TOPIC" ] && LOG_COLLECT=1
+[ "$UPLOAD_MODE" = "hf" ] && LOG_COLLECT=1
+if [ "$LOG_COLLECT" = "1" ]; then
   mkdir -p "$WORK_ROOT" || true
-  rm -f "$SHIP_STOP_FILE" || true
+  rm -f "$SHIP_STOP_FILE" "$HF_SHIP_STOP_FILE" || true
   echo 0 > "$SHIP_OFFSET_FILE" || true
+  echo 0 > "$HF_SHIP_MARK_FILE" || true
   exec > >(tee -a "$RUN_LOG") 2>&1
-  shipper_loop &
-  SHIPPER_PID=$!
   trap on_exit_ship EXIT
+  if [ -n "$LOG_TOPIC" ]; then
+    shipper_loop &
+    SHIPPER_PID=$!
+  fi
+  if [ "$UPLOAD_MODE" = "hf" ]; then
+    hf_shipper_loop &
+    HF_SHIP_PID=$!
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -371,6 +471,9 @@ marker "TRAIN exited with code $TRAIN_RC; final upload sweep"
 upload_pending_checkpoints
 kill "$WATCH_PID" >/dev/null 2>&1 || true
 upload_file "$LOG_FILE" || log "WARNING: log upload failed"
+if [ -f "$RUN_LOG" ]; then
+  upload_file "$RUN_LOG" || log "WARNING: run.log upload failed"
+fi
 for f in "$OUTPUT_DIR"/*.safetensors; do
   [ -e "$f" ] || continue
   if ! already_uploaded "$(basename "$f")"; then
