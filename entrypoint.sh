@@ -26,6 +26,7 @@ EPOCHS="${EPOCHS:-5}"                      # epochs (ignored when MAX_TRAIN_STEP
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"     # optional step cap, e.g. 100 for the smoke test
 DIAG_MODE="${DIAG_MODE:-}"                   # "survival" = downloads only, heartbeat, no training
 DIAG_MINUTES="${DIAG_MINUTES:-30}"           # survival-mode heartbeat duration, in minutes
+LOG_TOPIC="${LOG_TOPIC:-}"                   # if set, ship run.log to ntfy.sh/$LOG_TOPIC (log visibility)
 
 NETWORK_DIM="${NETWORK_DIM:-32}"
 NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
@@ -58,6 +59,11 @@ DATASET_ZIP="$WORK_ROOT/dataset.zip"
 EXTRACT_DIR="$WORK_ROOT/extract"
 OUTPUT_DIR="$WORK_ROOT/output"
 LOG_FILE="$WORK_ROOT/train.log"
+RUN_LOG="$WORK_ROOT/run.log"
+SHIP_OFFSET_FILE="$WORK_ROOT/.ship_offset"
+SHIP_STOP_FILE="$WORK_ROOT/.ship_stop"
+SHIP_CHUNK_MAX=3500
+SHIPPER_PID=""
 UPLOAD_MANIFEST="$WORK_ROOT/.uploaded"
 
 # ---------------------------------------------------------------------------
@@ -164,6 +170,103 @@ detect_train_dir() {
 }
 
 # ---------------------------------------------------------------------------
+# Log shipping (ntfy.sh) — diagnostic log visibility (added in 0.3.0)
+#
+# Salad's logs API returns 404 for this project, so when LOG_TOPIC is set we
+# mirror the console log to a public ntfy.sh topic (readable only by someone
+# who knows the unguessable topic name). All script output is tee'd into
+# $RUN_LOG; a background shipper posts the not-yet-sent tail every 30s, and
+# immediately when a new phase marker appears. Everything posted is scrubbed
+# of URL query strings so signed URLs (which carry credentials) never leak;
+# no secret values are printed to the log in the first place. On exit, a
+# trap ships the final tail plus "FINAL rc=<code>". Every shipper step is
+# best-effort (|| true): a shipper failure must never affect the main flow.
+# With LOG_TOPIC unset, behavior is identical to 0.2.0.
+# ---------------------------------------------------------------------------
+scrub_log_text() {
+  # Strip the query string ("?" and everything after it) from URLs.
+  sed -E 's#(https?://[^?[:space:]]+)\?[^[:space:]]*#\1#g'
+}
+
+ntfy_post() {
+  [ -n "$LOG_TOPIC" ] || return 0
+  curl -sS -m 20 -X POST --data-binary "$1" "https://ntfy.sh/$LOG_TOPIC" \
+    >/dev/null 2>&1 || true
+}
+
+ship_new_log() {
+  # Post the not-yet-sent tail of $RUN_LOG, scrubbed, in <=3.5KB chunks.
+  # Offset bookkeeping uses raw $RUN_LOG bytes; scrubbing only alters content.
+  [ -n "$LOG_TOPIC" ] || return 0
+  [ -f "$RUN_LOG" ] || return 0
+  local size=0 sent=0
+  size="$(stat -c%s "$RUN_LOG" 2>/dev/null || echo 0)"
+  [ -f "$SHIP_OFFSET_FILE" ] && sent="$(cat "$SHIP_OFFSET_FILE" 2>/dev/null || echo 0)"
+  case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
+  [ "$size" -gt "$sent" ] || return 0
+  local tmp="$WORK_ROOT/.ship_new"
+  tail -c +$(( sent + 1 )) "$RUN_LOG" 2>/dev/null | scrub_log_text > "$tmp" || true
+  echo "$size" > "$SHIP_OFFSET_FILE" || true
+  local total=0 chunks=0 i=0 part=""
+  total="$(stat -c%s "$tmp" 2>/dev/null || echo 0)"
+  if [ "$total" -le 0 ]; then rm -f "$tmp"; return 0; fi
+  chunks=$(( (total + SHIP_CHUNK_MAX - 1) / SHIP_CHUNK_MAX ))
+  for i in $(seq 1 "$chunks"); do
+    part="$(tail -c +$(( (i - 1) * SHIP_CHUNK_MAX + 1 )) "$tmp" 2>/dev/null | head -c "$SHIP_CHUNK_MAX")"
+    [ -n "$part" ] && ntfy_post "$part"
+  done
+  rm -f "$tmp"
+  return 0
+}
+
+unsent_has_marker() {
+  # True when the unsent tail of $RUN_LOG contains a phase marker line.
+  [ -f "$RUN_LOG" ] || return 1
+  local size=0 sent=0
+  size="$(stat -c%s "$RUN_LOG" 2>/dev/null || echo 0)"
+  [ -f "$SHIP_OFFSET_FILE" ] && sent="$(cat "$SHIP_OFFSET_FILE" 2>/dev/null || echo 0)"
+  case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
+  [ "$size" -gt "$sent" ] || return 1
+  tail -c +$(( sent + 1 )) "$RUN_LOG" 2>/dev/null | grep -q '===== \[salad-lora\]'
+}
+
+shipper_loop() {
+  local last=0 now=0
+  last="$(date +%s)"
+  while [ ! -f "$SHIP_STOP_FILE" ]; do
+    sleep 5
+    now="$(date +%s)"
+    if unsent_has_marker; then
+      ship_new_log || true
+      last="$(date +%s)"
+    elif [ $(( now - last )) -ge 30 ]; then
+      ship_new_log || true
+      last="$now"
+    fi
+  done
+}
+
+on_exit_ship() {
+  local rc=$?
+  [ -n "$LOG_TOPIC" ] || return 0
+  sleep 2 || true   # give tee a moment to flush the last lines into run.log
+  ship_new_log || true
+  ntfy_post "FINAL rc=$rc" || true
+  [ -n "$SHIPPER_PID" ] && kill "$SHIPPER_PID" >/dev/null 2>&1 || true
+  return 0
+}
+
+if [ -n "$LOG_TOPIC" ]; then
+  mkdir -p "$WORK_ROOT" || true
+  rm -f "$SHIP_STOP_FILE" || true
+  echo 0 > "$SHIP_OFFSET_FILE" || true
+  exec > >(tee -a "$RUN_LOG") 2>&1
+  shipper_loop &
+  SHIPPER_PID=$!
+  trap on_exit_ship EXIT
+fi
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 marker "START output_name=$OUTPUT_NAME epochs=$EPOCHS max_steps=${MAX_TRAIN_STEPS:-none} upload_mode=$UPLOAD_MODE"
@@ -182,12 +285,12 @@ marker "DOWNLOAD base model"
 declare -a DL_AUTH=()
 if [ -n "$HF_TOKEN" ]; then DL_AUTH=(-H "Authorization: Bearer $HF_TOKEN"); fi
 # -C - resumes a partial download after a node interruption restarts the job.
-curl -fL --retry 5 --retry-all-errors -C - -o "$MODEL_FILE" "${DL_AUTH[@]}" "$MODEL_URL" || {
+curl -sS -fL --retry 5 --retry-all-errors -C - -o "$MODEL_FILE" "${DL_AUTH[@]}" "$MODEL_URL" || {
   log "ERROR: model download failed"; exit 2; }
 ls -lh "$MODEL_FILE"
 
 marker "DOWNLOAD dataset"
-curl -fL --retry 5 --retry-all-errors -o "$DATASET_ZIP" "${DL_AUTH[@]}" "$DATASET_ZIP_URL" || {
+curl -sS -fL --retry 5 --retry-all-errors -o "$DATASET_ZIP" "${DL_AUTH[@]}" "$DATASET_ZIP_URL" || {
   log "ERROR: dataset download failed"; exit 2; }
 unzip -q -o "$DATASET_ZIP" -d "$EXTRACT_DIR" || {
   log "ERROR: dataset unzip failed"; exit 2; }
